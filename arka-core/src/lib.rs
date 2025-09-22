@@ -8,6 +8,8 @@ use std::sync::Arc;
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
+pub mod lsn;
+pub mod wal;
 
 #[derive(Debug, Clone)]
 pub enum ChangeOp {
@@ -60,11 +62,49 @@ pub fn splitmix64(mut x: u64) -> u64 {
     z ^ (z >> 31)
 }
 
-// Fast hash for binary keys
+// Fast hash for binary keys (general purpose)
 pub fn hash_key(key: &[u8]) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     key.hash(&mut hasher);
     splitmix64(hasher.finish())
+}
+
+// Type-aware hash function that matches indexing logic
+pub fn hash_key_typed(key: &[u8], data_type: &arrow::datatypes::DataType) -> u64 {
+    match data_type {
+        arrow::datatypes::DataType::Int64 => {
+            // For Int64, parse bytes as i64 and use splitmix64 directly (same as indexing)
+            if key.len() == 8 {
+                let value = i64::from_le_bytes([
+                    key[0], key[1], key[2], key[3], key[4], key[5], key[6], key[7],
+                ]);
+                splitmix64(value as u64)
+            } else {
+                // Fallback to general hash
+                hash_key(key)
+            }
+        }
+        arrow::datatypes::DataType::UInt64 => {
+            // For UInt64, parse bytes as u64 and use splitmix64 directly (same as indexing)
+            if key.len() == 8 {
+                let value = u64::from_le_bytes([
+                    key[0], key[1], key[2], key[3], key[4], key[5], key[6], key[7],
+                ]);
+                splitmix64(value)
+            } else {
+                // Fallback to general hash
+                hash_key(key)
+            }
+        }
+        arrow::datatypes::DataType::Binary | arrow::datatypes::DataType::Utf8 => {
+            // For Binary and Utf8, use general hash_key (same as indexing)
+            hash_key(key)
+        }
+        _ => {
+            // For all other types, use general hash (same as indexing fallback)
+            hash_key(key)
+        }
+    }
 }
 
 // Location of a row within a batch for fast CDC lookups
@@ -92,10 +132,10 @@ pub enum IndexType {
 
 // Production index system
 #[derive(Debug)]
-pub struct ProductionIndex {
+pub struct ArkMemorySliceIndex {
     pub index_type: IndexType,
 
-    // Hash-based index (like Moonlink's SinglePrimitiveKey)
+    // Hash-based index
     hash_to_location: DashMap<u64, BatchLocation>,
 
     // Bloom filter for negative lookups
@@ -163,7 +203,7 @@ impl BloomFilter {
     }
 }
 
-impl ProductionIndex {
+impl ArkMemorySliceIndex {
     pub fn new(index_type: IndexType, expected_items: usize) -> Self {
         Self {
             index_type,
@@ -302,6 +342,7 @@ pub struct MemorySlice {
     // Metadata
     row_count: AtomicUsize,
     byte_size: AtomicUsize,
+
     oldest_timestamp: RwLock<Option<i64>>,
     newest_timestamp: RwLock<Option<i64>>,
 
@@ -312,28 +353,37 @@ pub struct MemorySlice {
     pub visibility_lsn_tx: watch::Sender<ArkaVisibilityLsn>,
 
     // NEW: Production-level index system
-    pub production_index: Arc<ProductionIndex>,
+    pub memory_slice_index: Arc<ArkMemorySliceIndex>,
 
     // NEW: Track CDC changes for disk propagation
     pending_disk_changes: RwLock<Vec<PendingChange>>,
 }
 
 impl MemorySlice {
-    pub fn new(lsn_generator: Arc<ArkaLsnGenerator>, append_only: bool) -> Self {
+    pub fn new(lsn_generator: Arc<ArkaLsnGenerator>, config: &ArkConfig) -> Self {
         let (visibility_tx, _) = watch::channel(ArkaVisibilityLsn {
             commit_lsn: 0,
             write_lsn: 0,
         });
 
-        // Determine index type based on table mode
-        let index_type = if append_only {
+        // Determine index type based on configuration
+        let index_type = if config.append_only
+            || (!config.enable_point_lookups && !config.enable_cdc)
+            || config.primary_key_columns.is_none()
+        {
             IndexType::None
+        } else if let Some(ref primary_cols) = config.primary_key_columns {
+            if primary_cols.len() == 1 {
+                IndexType::SinglePrimitive(primary_cols[0])
+            } else {
+                IndexType::Composite(primary_cols.clone())
+            }
         } else {
-            IndexType::SinglePrimitive(0) // Default: first column is primary key
+            IndexType::None
         };
 
         Self {
-            append_only,
+            append_only: config.append_only,
             batches: RwLock::new(Vec::new()),
             lsn_generator,
             latest_commit_lsn: AtomicU64::new(0),
@@ -346,8 +396,8 @@ impl MemorySlice {
             last_flush_time: RwLock::new(Instant::now()),
             visibility_lsn_tx: visibility_tx,
 
-            // NEW: Initialize production index
-            production_index: Arc::new(ProductionIndex::new(index_type, 1_000_000)), // Expect 1M items
+            // Initialize index based on configuration
+            memory_slice_index: Arc::new(ArkMemorySliceIndex::new(index_type, 1_000_000)), // Expect 1M items
             pending_disk_changes: RwLock::new(Vec::new()),
         }
     }
@@ -357,22 +407,6 @@ impl MemorySlice {
         let lsn = self.lsn_generator.next();
         let batch_id = self.next_batch_id.fetch_add(1, Ordering::SeqCst);
 
-        // Build key index for this batch
-        // Note: For production, we should only index new batches, not rebuild all
-        // This is inefficient and should be optimized
-        if !self.append_only {
-            let existing_batches: Vec<(RecordBatch, u64, u64)> = {
-                let batches = self.batches.read().unwrap();
-                batches
-                    .iter()
-                    .map(|b| (b.data.clone(), b.batch_id, b.lsn))
-                    .collect()
-            };
-
-            for (data, batch_id, lsn) in existing_batches {
-                self.build_key_index_for_batch(&data, batch_id, lsn).await;
-            }
-        }
         self.build_key_index_for_batch(&batch, batch_id, lsn).await;
 
         let memory_batch = MemoryBatch {
@@ -402,11 +436,11 @@ impl MemorySlice {
     // Production-level key index builder with configurable key extraction
     async fn build_key_index_for_batch(&self, batch: &RecordBatch, batch_id: u64, batch_lsn: u64) {
         // Skip indexing for append-only tables
-        if matches!(self.production_index.index_type, IndexType::None) {
+        if matches!(self.memory_slice_index.index_type, IndexType::None) {
             return;
         }
 
-        match &self.production_index.index_type {
+        match &self.memory_slice_index.index_type {
             IndexType::SinglePrimitive(column_idx) => {
                 self.build_single_primitive_index(batch, *column_idx, batch_id, batch_lsn)
                     .await;
@@ -447,7 +481,7 @@ impl MemorySlice {
                                 lsn: batch_lsn,
                             };
 
-                            self.production_index.insert(key_hash, location);
+                            self.memory_slice_index.insert(key_hash, location);
                         }
                     }
                 }
@@ -465,7 +499,7 @@ impl MemorySlice {
                                 lsn: batch_lsn,
                             };
 
-                            self.production_index.insert(key_hash, location);
+                            self.memory_slice_index.insert(key_hash, location);
                         }
                     }
                 }
@@ -483,7 +517,7 @@ impl MemorySlice {
                                 lsn: batch_lsn,
                             };
 
-                            self.production_index.insert(key_hash, location);
+                            self.memory_slice_index.insert(key_hash, location);
                         }
                     }
                 }
@@ -501,7 +535,7 @@ impl MemorySlice {
                                 lsn: batch_lsn,
                             };
 
-                            self.production_index.insert(key_hash, location);
+                            self.memory_slice_index.insert(key_hash, location);
                         }
                     }
                 }
@@ -518,7 +552,7 @@ impl MemorySlice {
                         lsn: batch_lsn,
                     };
 
-                    self.production_index.insert(key_hash, location);
+                    self.memory_slice_index.insert(key_hash, location);
                 }
             }
         }
@@ -554,7 +588,7 @@ impl MemorySlice {
                     lsn: batch_lsn,
                 };
 
-                self.production_index.insert(key_hash, location);
+                self.memory_slice_index.insert(key_hash, location);
             }
         }
     }
@@ -618,18 +652,40 @@ impl MemorySlice {
             }
         }
 
-        // For now, just return original batch (proper Arrow filtering needs more complex code)
-        // TODO: Implement proper Arrow compute filtering
-        batch.clone()
+        let mask_array = arrow::array::BooleanArray::from(keep_mask);
+
+        let filtered_columns: Result<
+            Vec<std::sync::Arc<dyn arrow::array::Array>>,
+            arrow::error::ArrowError,
+        > = batch
+            .columns()
+            .iter()
+            .map(|column| arrow::compute::filter(column, &mask_array))
+            .collect();
+
+        match filtered_columns {
+            Ok(columns) => {
+                match RecordBatch::try_new(batch.schema(), columns) {
+                    Ok(filtered_batch) => filtered_batch,
+                    Err(_e) => batch.clone(), // Fallback on error
+                }
+            }
+            Err(_e) => batch.clone(), // Fallback on error
+        }
     }
 
-    // Production CDC delete with hash-based lookup
-    pub async fn apply_cdc_delete(&self, key: &[u8], target_lsn: u64) -> Result<u64, String> {
+    // Production CDC delete with hash-based lookup - FIXED with type-aware hashing
+    pub async fn apply_cdc_delete(
+        &self,
+        key: &[u8],
+        key_column_type: &arrow::datatypes::DataType,
+        target_lsn: u64,
+    ) -> Result<u64, String> {
         let change_lsn = self.lsn_generator.next();
-        let key_hash = hash_key(key);
+        let key_hash = hash_key_typed(key, key_column_type);
 
         // Fast O(1) hash lookup with bloom filter optimization
-        if let Some(location) = self.production_index.lookup(key_hash) {
+        if let Some(location) = self.memory_slice_index.lookup(key_hash) {
             if location.lsn == target_lsn {
                 // Apply to specific batch and row
                 let mut batches = self.batches.write().unwrap();
@@ -637,7 +693,7 @@ impl MemorySlice {
                     batch.deletions.mark_deleted(location.row_index, change_lsn);
 
                     // Remove from index (the key no longer exists)
-                    self.production_index.remove(key_hash);
+                    self.memory_slice_index.remove(key_hash);
 
                     // Track for disk propagation
                     let pending_change = PendingChange {
@@ -664,33 +720,73 @@ impl MemorySlice {
 
     // Get production index statistics
     pub fn get_index_stats(&self) -> IndexStats {
-        self.production_index.stats()
+        self.memory_slice_index.stats()
     }
 
-    // Check if a key might exist (bloom filter check)
-    pub fn might_contain_key(&self, key: &[u8]) -> bool {
-        let key_hash = hash_key(key);
-        self.production_index.bloom_filter.might_contain(key_hash)
+    // Check if a key might exist (bloom filter check) - FIXED with type-aware hashing
+    pub fn might_contain_key(
+        &self,
+        key: &[u8],
+        key_column_type: &arrow::datatypes::DataType,
+    ) -> bool {
+        let key_hash = hash_key_typed(key, key_column_type);
+        self.memory_slice_index.bloom_filter.might_contain(key_hash)
     }
 
-    // Production-level point lookup
-    pub async fn lookup_key(&self, key: &[u8]) -> Option<BatchLocation> {
-        let key_hash = hash_key(key);
-        self.production_index.lookup(key_hash)
+    // Production-level point lookup - FIXED with type-aware hashing
+    pub async fn lookup_key(
+        &self,
+        key: &[u8],
+        key_column_type: &arrow::datatypes::DataType,
+    ) -> Option<BatchLocation> {
+        let key_hash = hash_key_typed(key, key_column_type);
+        self.memory_slice_index.lookup(key_hash)
     }
 
-    // Apply any CDC change operation
-    pub async fn apply_change_operation(&self, change: ChangeOp) -> Result<u64, String> {
+    // Convenience method to get primary key column data type
+    pub fn get_primary_key_type(
+        &self,
+        schema: &arrow::datatypes::Schema,
+    ) -> Option<arrow::datatypes::DataType> {
+        match &self.memory_slice_index.index_type {
+            IndexType::SinglePrimitive(column_idx) => schema
+                .fields()
+                .get(*column_idx)
+                .map(|field| field.data_type().clone()),
+            IndexType::Composite(column_indices) => {
+                // For composite keys, we could return a tuple type or the first column type
+                // For now, return the first column type
+                if let Some(&first_col) = column_indices.first() {
+                    schema
+                        .fields()
+                        .get(first_col)
+                        .map(|field| field.data_type().clone())
+                } else {
+                    None
+                }
+            }
+            IndexType::None => None,
+        }
+    }
+
+    // Apply any CDC change operation - FIXED with type-aware hashing
+    pub async fn apply_change_operation(
+        &self,
+        change: ChangeOp,
+        key_column_type: &arrow::datatypes::DataType,
+    ) -> Result<u64, String> {
         match change {
             ChangeOp::Delete { key, old_value_lsn } => {
-                self.apply_cdc_delete(&key, old_value_lsn).await
+                self.apply_cdc_delete(&key, key_column_type, old_value_lsn)
+                    .await
             }
             ChangeOp::Update {
                 key, old_value_lsn, ..
             } => {
                 // For now, updates are handled as delete + insert
                 // TODO: Implement proper update logic
-                self.apply_cdc_delete(&key, old_value_lsn).await
+                self.apply_cdc_delete(&key, key_column_type, old_value_lsn)
+                    .await
             }
         }
     }
@@ -716,7 +812,7 @@ pub struct ArkTable {
 impl ArkTable {
     pub fn new(name: String, schema: Arc<Schema>, config: Arc<ArkConfig>) -> Self {
         let lsn_generator = Arc::new(ArkaLsnGenerator::new());
-        let memory_slice = Arc::new(MemorySlice::new(lsn_generator.clone(), config.append_only));
+        let memory_slice = Arc::new(MemorySlice::new(lsn_generator.clone(), &config));
         let visibility_rx = memory_slice.visibility_lsn_tx.subscribe();
 
         Self {
@@ -743,12 +839,19 @@ impl ArkTable {
         self.memory_slice.get_read_snapshot(as_of_lsn).await
     }
 
-    // Apply CDC change to the table
+    // Apply CDC change to the table - FIXED with type-aware hashing
     pub async fn apply_cdc_change(&self, change: ChangeOp) -> Result<u64, String> {
-        let change_lsn = self.memory_slice.apply_change_operation(change).await?;
-        // Auto-commit CDC changes
-        self.memory_slice.commit(change_lsn).await?;
-        Ok(change_lsn)
+        if let Some(key_type) = self.memory_slice.get_primary_key_type(&self.schema) {
+            let change_lsn = self
+                .memory_slice
+                .apply_change_operation(change, &key_type)
+                .await?;
+            // Auto-commit CDC changes
+            self.memory_slice.commit(change_lsn).await?;
+            Ok(change_lsn)
+        } else {
+            Err("Table has no primary key for CDC operations".to_string())
+        }
     }
 
     // Get production index statistics
@@ -756,14 +859,131 @@ impl ArkTable {
         self.memory_slice.get_index_stats()
     }
 
-    // Production-level key lookup
+    // Production-level key lookup - FIXED with type-aware hashing
     pub async fn lookup_key(&self, key: &[u8]) -> Option<BatchLocation> {
-        self.memory_slice.lookup_key(key).await
+        if let Some(key_type) = self.memory_slice.get_primary_key_type(&self.schema) {
+            self.memory_slice.lookup_key(key, &key_type).await
+        } else {
+            None
+        }
     }
 
-    // Check if key might exist (fast bloom filter check)
+    // Check if key might exist (fast bloom filter check) - FIXED with type-aware hashing
     pub fn key_might_exist(&self, key: &[u8]) -> bool {
-        self.memory_slice.might_contain_key(key)
+        if let Some(key_type) = self.memory_slice.get_primary_key_type(&self.schema) {
+            self.memory_slice.might_contain_key(key, &key_type)
+        } else {
+            false
+        }
+    }
+
+    // ===== NEW: Type-Safe Lookup APIs =====
+
+    // Type-safe lookup for Int64 keys
+    pub async fn lookup_by_int64(&self, column_idx: usize, value: i64) -> Option<BatchLocation> {
+        match &self.memory_slice.memory_slice_index.index_type {
+            IndexType::SinglePrimitive(idx) if *idx == column_idx => {
+                let key_hash = splitmix64(value as u64); // Consistent with indexing
+                self.memory_slice.memory_slice_index.lookup(key_hash)
+            }
+            _ => None,
+        }
+    }
+
+    // Type-safe lookup for UInt64 keys
+    pub async fn lookup_by_uint64(&self, column_idx: usize, value: u64) -> Option<BatchLocation> {
+        match &self.memory_slice.memory_slice_index.index_type {
+            IndexType::SinglePrimitive(idx) if *idx == column_idx => {
+                let key_hash = splitmix64(value); // Consistent with indexing
+                self.memory_slice.memory_slice_index.lookup(key_hash)
+            }
+            _ => None,
+        }
+    }
+
+    // Type-safe lookup for String keys
+    pub async fn lookup_by_string(&self, column_idx: usize, value: &str) -> Option<BatchLocation> {
+        match &self.memory_slice.memory_slice_index.index_type {
+            IndexType::SinglePrimitive(idx) if *idx == column_idx => {
+                let key_hash = hash_key(value.as_bytes()); // Consistent with indexing
+                self.memory_slice.memory_slice_index.lookup(key_hash)
+            }
+            _ => None,
+        }
+    }
+
+    // Type-safe bloom filter check for Int64 keys
+    pub fn int64_might_exist(&self, column_idx: usize, value: i64) -> bool {
+        match &self.memory_slice.memory_slice_index.index_type {
+            IndexType::SinglePrimitive(idx) if *idx == column_idx => {
+                let key_hash = splitmix64(value as u64);
+                self.memory_slice
+                    .memory_slice_index
+                    .bloom_filter
+                    .might_contain(key_hash)
+            }
+            _ => false,
+        }
+    }
+
+    // Type-safe bloom filter check for String keys
+    pub fn string_might_exist(&self, column_idx: usize, value: &str) -> bool {
+        match &self.memory_slice.memory_slice_index.index_type {
+            IndexType::SinglePrimitive(idx) if *idx == column_idx => {
+                let key_hash = hash_key(value.as_bytes());
+                self.memory_slice
+                    .memory_slice_index
+                    .bloom_filter
+                    .might_contain(key_hash)
+            }
+            _ => false,
+        }
+    }
+
+    // Type-safe CDC delete for Int64 keys
+    pub async fn delete_by_int64(
+        &self,
+        column_idx: usize,
+        value: i64,
+        target_lsn: u64,
+    ) -> Result<u64, String> {
+        match &self.memory_slice.memory_slice_index.index_type {
+            IndexType::SinglePrimitive(idx) if *idx == column_idx => {
+                let key_bytes = value.to_le_bytes();
+                let key_type = arrow::datatypes::DataType::Int64;
+                let change_lsn = self
+                    .memory_slice
+                    .apply_cdc_delete(&key_bytes, &key_type, target_lsn)
+                    .await?;
+                // Auto-commit CDC changes (same as apply_cdc_change)
+                self.memory_slice.commit(change_lsn).await?;
+                Ok(change_lsn)
+            }
+            _ => Err("Column index does not match primary key".to_string()),
+        }
+    }
+
+    // Type-safe CDC delete for String keys
+    pub async fn delete_by_string(
+        &self,
+        column_idx: usize,
+        value: &str,
+        target_lsn: u64,
+    ) -> Result<u64, String> {
+        match &self.memory_slice.memory_slice_index.index_type {
+            IndexType::SinglePrimitive(idx) if *idx == column_idx => {
+                let key_bytes = value.as_bytes();
+                let key_type = arrow::datatypes::DataType::Utf8;
+                let change_lsn = self
+                    .memory_slice
+                    .apply_cdc_delete(key_bytes, &key_type, target_lsn)
+                    .await?;
+                // Auto-commit CDC changes (same as apply_cdc_change)
+                self.memory_slice.commit(change_lsn).await?;
+                Ok(change_lsn)
+            }
+            _ => Err("Column index does not match primary key".to_string()),
+        }
     }
 }
 
@@ -780,6 +1000,61 @@ pub struct ArkConfig {
     // Table properties
     pub append_only: bool,
 
+    // NEW: Indexing control
+    pub enable_point_lookups: bool, // Enable fast key-based lookups
+    pub enable_cdc: bool,           // Enable Change Data Capture operations
+    pub primary_key_columns: Option<Vec<usize>>, // Which columns to index (None = no indexing)
+
     // LSN settings
     pub commit_batch_size: usize, // How many operations before auto-commit
+}
+
+impl ArkConfig {
+    /// Configuration for append-only event/log tables (no indexing)
+    pub fn append_only_events() -> Self {
+        Self {
+            memory_threshold: 1024 * 1024, // 1MB
+            row_threshold: 1000,
+            memory_max_size: 10 * 1024 * 1024, // 10MB
+            flush_interval: Duration::from_secs(60),
+            parquet_file_target_size: 128 * 1024 * 1024, // 128MB
+            append_only: true,
+            enable_point_lookups: false,
+            enable_cdc: false,
+            primary_key_columns: None,
+            commit_batch_size: 100,
+        }
+    }
+
+    /// Configuration for CDC-enabled tables with indexing
+    pub fn cdc_enabled_table(primary_key_columns: Vec<usize>) -> Self {
+        Self {
+            memory_threshold: 1024 * 1024, // 1MB
+            row_threshold: 1000,
+            memory_max_size: 10 * 1024 * 1024, // 10MB
+            flush_interval: Duration::from_secs(60),
+            parquet_file_target_size: 128 * 1024 * 1024, // 128MB
+            append_only: false,
+            enable_point_lookups: true,
+            enable_cdc: true,
+            primary_key_columns: Some(primary_key_columns),
+            commit_batch_size: 100,
+        }
+    }
+
+    /// Configuration for analytical tables with optional point lookups
+    pub fn analytical_with_lookups(primary_key_columns: Vec<usize>) -> Self {
+        Self {
+            memory_threshold: 1024 * 1024, // 1MB
+            row_threshold: 1000,
+            memory_max_size: 10 * 1024 * 1024, // 10MB
+            flush_interval: Duration::from_secs(60),
+            parquet_file_target_size: 128 * 1024 * 1024, // 128MB
+            append_only: false,
+            enable_point_lookups: true,
+            enable_cdc: false, // No CDC, just fast lookups
+            primary_key_columns: Some(primary_key_columns),
+            commit_batch_size: 100,
+        }
+    }
 }
