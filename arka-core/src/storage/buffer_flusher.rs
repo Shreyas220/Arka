@@ -274,12 +274,15 @@ impl BufferFlusher {
 /// Extract primary keys from a RecordBatch
 ///
 /// Looks for the `id` column and maps each value to its row offset.
+/// If the `id` column is not found, returns an empty vector (no PK indexing).
 fn extract_primary_keys(batch: &RecordBatch) -> Result<Vec<(String, u32)>, BufferFlusherError> {
     use arrow::array::*;
 
-    let id_col = batch
-        .column_by_name("id")
-        .ok_or(BufferFlusherError::MissingPrimaryKey)?;
+    // Try to find "id" column - if not present, skip PK indexing
+    let id_col = match batch.column_by_name("id") {
+        Some(col) => col,
+        None => return Ok(Vec::new()), // No "id" column, skip PK extraction
+    };
 
     let id_array = id_col
         .as_any()

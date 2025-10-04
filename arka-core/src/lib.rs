@@ -8,12 +8,13 @@ use std::sync::Arc;
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
-pub mod lsn;
-pub mod wal;
+// pub mod lsn;
 
 // New modular architecture
-pub mod storage;
+pub mod catalog;
+pub mod flight;
 pub mod indexes;
+pub mod storage;
 
 #[derive(Debug, Clone)]
 pub enum ChangeOp {
@@ -29,26 +30,8 @@ pub enum ChangeOp {
     },
 }
 
-// LSN Generator
-pub struct ArkaLsnGenerator {
-    next_lsn: AtomicU64,
-}
-
-impl ArkaLsnGenerator {
-    pub fn new() -> Self {
-        Self {
-            next_lsn: AtomicU64::new(1), // Start from 1, reserve 0 for NO_LSN
-        }
-    }
-
-    pub fn next(&self) -> u64 {
-        self.next_lsn.fetch_add(1, Ordering::SeqCst)
-    }
-
-    pub fn current(&self) -> u64 {
-        self.next_lsn.load(Ordering::SeqCst)
-    }
-}
+// LSN management is now handled by storage::LSNManager
+// (removed ArkaLsnGenerator - use storage::LSNManager instead)
 
 // Visibility LSN tracking for read consistency
 #[derive(Debug, Clone, Copy)]
@@ -335,8 +318,8 @@ pub struct MemorySlice {
     // Ordered batches by LSN
     batches: RwLock<Vec<MemoryBatch>>,
 
-    // LSN tracking
-    lsn_generator: Arc<ArkaLsnGenerator>,
+    // LSN tracking using storage::LSNManager
+    lsn_manager: Arc<storage::LSNManager>,
     latest_commit_lsn: AtomicU64,
     latest_write_lsn: AtomicU64,
 
@@ -364,7 +347,7 @@ pub struct MemorySlice {
 }
 
 impl MemorySlice {
-    pub fn new(lsn_generator: Arc<ArkaLsnGenerator>, config: &ArkConfig) -> Self {
+    pub fn new(lsn_manager: Arc<storage::LSNManager>, config: &ArkConfig) -> Self {
         let (visibility_tx, _) = watch::channel(ArkaVisibilityLsn {
             commit_lsn: 0,
             write_lsn: 0,
@@ -389,7 +372,7 @@ impl MemorySlice {
         Self {
             append_only: config.append_only,
             batches: RwLock::new(Vec::new()),
-            lsn_generator,
+            lsn_manager,
             latest_commit_lsn: AtomicU64::new(0),
             latest_write_lsn: AtomicU64::new(0),
             next_batch_id: AtomicU64::new(1),
@@ -408,7 +391,7 @@ impl MemorySlice {
 
     // Append a new batch and build key index
     pub async fn append_batch(&self, batch: RecordBatch) -> Result<u64, String> {
-        let lsn = self.lsn_generator.next();
+        let lsn = self.lsn_manager.assign();
         let batch_id = self.next_batch_id.fetch_add(1, Ordering::SeqCst);
 
         self.build_key_index_for_batch(&batch, batch_id, lsn).await;
@@ -685,7 +668,7 @@ impl MemorySlice {
         key_column_type: &arrow::datatypes::DataType,
         target_lsn: u64,
     ) -> Result<u64, String> {
-        let change_lsn = self.lsn_generator.next();
+        let change_lsn = self.lsn_manager.assign();
         let key_hash = hash_key_typed(key, key_column_type);
 
         // Fast O(1) hash lookup with bloom filter optimization
@@ -806,35 +789,105 @@ pub struct ArkTable {
     // Memory layer (hot)
     pub memory_slice: Arc<MemorySlice>,
 
-    // LSN management
-    lsn_generator: Arc<ArkaLsnGenerator>,
+    // LSN management - single source of truth
+    pub lsn_manager: Arc<storage::LSNManager>,
+
+    // Storage layer for disk persistence
+    write_buffer: Arc<storage::WriteBuffer>,
+    buffer_flusher: Arc<RwLock<Option<storage::BufferFlusher>>>,
 
     // Visibility for readers
     visibility_lsn_rx: watch::Receiver<ArkaVisibilityLsn>,
 }
 
 impl ArkTable {
-    pub fn new(name: String, schema: Arc<Schema>, config: Arc<ArkConfig>) -> Self {
-        let lsn_generator = Arc::new(ArkaLsnGenerator::new());
-        let memory_slice = Arc::new(MemorySlice::new(lsn_generator.clone(), &config));
+    pub fn new(
+        name: String,
+        schema: Arc<Schema>,
+        config: Arc<ArkConfig>,
+        base_path: String,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        // Create single LSNManager for both memory and storage
+        let lsn_manager = Arc::new(storage::LSNManager::new());
+
+        // Create MemorySlice using the shared LSNManager
+        let memory_slice = Arc::new(MemorySlice::new(lsn_manager.clone(), &config));
         let visibility_rx = memory_slice.visibility_lsn_tx.subscribe();
 
-        Self {
+        // Create WriteBuffer for batching writes
+        let write_buffer = Arc::new(storage::WriteBuffer::new());
+
+        // BufferFlusher will be initialized and started separately
+        let buffer_flusher = Arc::new(RwLock::new(None));
+
+        Ok(Self {
             name,
             schema,
             prev_schema: Vec::new(),
             config,
             memory_slice,
-            lsn_generator,
+            lsn_manager,
+            write_buffer,
+            buffer_flusher,
             visibility_lsn_rx: visibility_rx,
+        })
+    }
+
+    /// Start background buffer flusher with LSN tracking
+    ///
+    /// This creates a SegmentWriter and BufferFlusher, then starts the background
+    /// flush loop that writes buffers to disk and updates LSNcoordinator.
+    pub fn start_buffer_flusher(
+        &self,
+        base_path: String,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use std::path::PathBuf;
+
+        // Create segment writer
+        let segments_dir = PathBuf::from(&base_path).join("segments");
+        let segment_writer = Arc::new(storage::SegmentWriter::new(segments_dir)?);
+
+        // Create indexes (for now, empty - TODO: integrate properly)
+        let pk_index = Arc::new(RwLock::new(crate::indexes::pk_index::PKIndex::new()));
+        let segment_index = Arc::new(RwLock::new(
+            crate::indexes::segment_index::SegmentIndex::new(),
+        ));
+
+        // Create and start buffer flusher
+        let mut flusher = storage::BufferFlusher::new(
+            self.write_buffer.clone(),
+            segment_writer,
+            pk_index,
+            segment_index,
+        );
+
+        flusher.start();
+
+        // Store flusher so we can stop it later
+        if let Ok(mut flusher_guard) = self.buffer_flusher.write() {
+            *flusher_guard = Some(flusher);
         }
+
+        // TODO: Hook into flush completion to call lsn_coordinator.mark_wal_durable()
+        // For now, we'll use a separate polling mechanism in Flight service
+
+        Ok(())
     }
 
     // Ingest Arrow Flight batch
     pub async fn ingest_batch(&self, batch: RecordBatch) -> Result<u64, String> {
-        let lsn = self.memory_slice.append_batch(batch).await?;
-        // Auto-commit for now (in production, might batch commits)
+        // 1. Append to memory (for queries)
+        let lsn = self.memory_slice.append_batch(batch.clone()).await?;
+
+        // 2. Append to write buffer (for disk persistence)
+        self.write_buffer
+            .append(batch)
+            .await
+            .map_err(|e| format!("WriteBuffer append failed: {}", e))?;
+
+        // 3. Auto-commit
         self.memory_slice.commit(lsn).await?;
+
         Ok(lsn)
     }
 
