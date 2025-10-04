@@ -7,9 +7,9 @@ This document captures the key architectural decisions made for Arka, a high-per
 ## Core Architecture
 
 ```
-Streaming Data → WAL (Arrow IPC) → DuckDB → Iceberg
-                  ↓                  ↓
-                 LSN               Query Engine
+Streaming Data → WAL (Arrow IPC) → DuckDB 
+                 ↓     ↓            ↓
+               LSN  iceberg       Query Engine
 ```
 
 ## 1. WAL Storage Format: Arrow IPC

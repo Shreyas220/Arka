@@ -11,6 +11,10 @@ use tokio::sync::watch;
 pub mod lsn;
 pub mod wal;
 
+// New modular architecture
+pub mod storage;
+pub mod indexes;
+
 #[derive(Debug, Clone)]
 pub enum ChangeOp {
     Delete {
