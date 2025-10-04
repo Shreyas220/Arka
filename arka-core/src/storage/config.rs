@@ -122,7 +122,7 @@ impl WriteBufferConfig {
     /// Create config optimized for high throughput
     pub fn high_throughput() -> Self {
         Self {
-            max_unflushed_bytes: 1024 * 1024 * 1024, // 1 GB
+            max_unflushed_bytes: 1024 * 1024 * 1024,  // 1 GB
             max_buffer_size_bytes: 128 * 1024 * 1024, // 128 MB
             max_batches_per_buffer: 10000,
             flush_interval: Duration::from_millis(500), // Flush less frequently
@@ -132,7 +132,7 @@ impl WriteBufferConfig {
     /// Create config optimized for low latency
     pub fn low_latency() -> Self {
         Self {
-            max_unflushed_bytes: 128 * 1024 * 1024, // 128 MB
+            max_unflushed_bytes: 128 * 1024 * 1024,  // 128 MB
             max_buffer_size_bytes: 16 * 1024 * 1024, // 16 MB
             max_batches_per_buffer: 100,
             flush_interval: Duration::from_millis(50), // Flush more frequently

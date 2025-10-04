@@ -859,6 +859,7 @@ impl ArkTable {
             segment_writer,
             pk_index,
             segment_index,
+            self.lsn_manager.clone(),
         );
 
         flusher.start();
@@ -868,7 +869,7 @@ impl ArkTable {
             *flusher_guard = Some(flusher);
         }
 
-        // TODO: Hook into flush completion to call lsn_coordinator.mark_wal_durable()
+        // TODO: Hook into flush completion to call lsn_manager.mark_wal_durable()
         // For now, we'll use a separate polling mechanism in Flight service
 
         Ok(())
@@ -879,9 +880,9 @@ impl ArkTable {
         // 1. Append to memory (for queries)
         let lsn = self.memory_slice.append_batch(batch.clone()).await?;
 
-        // 2. Append to write buffer (for disk persistence)
+        // 2. Append to write buffer (for disk persistence) with LSN
         self.write_buffer
-            .append(batch)
+            .append(batch, lsn)
             .await
             .map_err(|e| format!("WriteBuffer append failed: {}", e))?;
 

@@ -150,9 +150,19 @@ impl SegmentWriter {
     ///
     /// # Arguments
     /// * `batches` - Vec of RecordBatches (must all have same schema)
+    /// * `lsn_override` - Optional LSN range to use instead of extracting from batches
     pub fn write_batches(
         &self,
         batches: &[RecordBatch],
+    ) -> Result<SegmentMeta, SegmentWriterError> {
+        self.write_batches_with_lsn(batches, None)
+    }
+
+    /// Write multiple batches with explicit LSN range
+    pub fn write_batches_with_lsn(
+        &self,
+        batches: &[RecordBatch],
+        lsn_override: Option<(u64, u64)>,
     ) -> Result<SegmentMeta, SegmentWriterError> {
         if batches.is_empty() {
             return Err(SegmentWriterError::EmptyBatch);
@@ -177,11 +187,19 @@ impl SegmentWriter {
                 max_timestamp = max_timestamp.max(max);
             }
 
-            // Extract LSN range if __lsn column exists
-            if let Some((min, max)) = extract_lsn_range(batch)? {
-                min_lsn = min_lsn.min(min);
-                max_lsn = max_lsn.max(max);
+            // Extract LSN range if __lsn column exists (unless overridden)
+            if lsn_override.is_none() {
+                if let Some((min, max)) = extract_lsn_range(batch)? {
+                    min_lsn = min_lsn.min(min);
+                    max_lsn = max_lsn.max(max);
+                }
             }
+        }
+
+        // Use LSN override if provided
+        if let Some((min, max)) = lsn_override {
+            min_lsn = min;
+            max_lsn = max;
         }
 
         // Write all batches to file

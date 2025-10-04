@@ -8,10 +8,6 @@ default-run = "arka-core"
 name = "arka-core"
 path = "src/main.rs"
 
-[[bin]]
-name = "test-runner"
-path = "src/tests.rs"
-
 [[example]]
 name = "rust_client"
 path = "examples/rust_client.rs"

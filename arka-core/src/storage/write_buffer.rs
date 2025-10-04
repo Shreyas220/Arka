@@ -18,6 +18,10 @@ pub struct FrozenBuffer {
 
     /// Timestamp when this buffer was frozen (Unix epoch seconds)
     pub frozen_at: i64,
+
+    /// LSN range covered by batches in this buffer
+    /// Used for durability tracking - allows marking LSNs as flushed after write
+    pub lsn_range: Option<(u64, u64)>,
 }
 
 /// Internal state of the current mutable buffer
@@ -28,6 +32,10 @@ struct BufferState {
 
     /// Total size in bytes of all batches
     size_bytes: usize,
+
+    /// LSN range for batches in this buffer
+    min_lsn: Option<u64>,
+    max_lsn: Option<u64>,
 }
 
 impl BufferState {
@@ -35,6 +43,8 @@ impl BufferState {
         Self {
             batches: Vec::new(),
             size_bytes: 0,
+            min_lsn: None,
+            max_lsn: None,
         }
     }
 
@@ -126,7 +136,7 @@ impl WriteBuffer {
     ///
     /// # Returns
     /// Returns true if the buffer should be frozen after this append
-    pub async fn append(&self, batch: RecordBatch) -> Result<bool, WriteBufferError> {
+    pub async fn append(&self, batch: RecordBatch, lsn: u64) -> Result<bool, WriteBufferError> {
         if batch.num_rows() == 0 {
             return Err(WriteBufferError::EmptyBatch);
         }
@@ -140,7 +150,7 @@ impl WriteBuffer {
             self.space_available.notified().await;
         }
 
-        // Add to current buffer
+        // Add to current buffer and track LSN range
         let should_freeze = {
             let mut current = self
                 .current
@@ -148,6 +158,10 @@ impl WriteBuffer {
                 .map_err(|_| WriteBufferError::LockError)?;
             current.batches.push(batch);
             current.size_bytes += batch_size;
+
+            // Track LSN range
+            current.min_lsn = Some(current.min_lsn.map_or(lsn, |min| min.min(lsn)));
+            current.max_lsn = Some(current.max_lsn.map_or(lsn, |max| max.max(lsn)));
 
             // Check if we should freeze after this append
             current.should_freeze(&self.config)
@@ -186,11 +200,18 @@ impl WriteBuffer {
         // Atomic swap: replace current with empty buffer
         let frozen_state = std::mem::replace(&mut *current, BufferState::new());
 
+        // Build LSN range from min/max
+        let lsn_range = match (frozen_state.min_lsn, frozen_state.max_lsn) {
+            (Some(min), Some(max)) => Some((min, max)),
+            _ => None,
+        };
+
         // Move to immutable queue
         immutable.push_back(FrozenBuffer {
             batches: frozen_state.batches,
             size_bytes: frozen_state.size_bytes,
             frozen_at: chrono::Utc::now().timestamp(),
+            lsn_range,
         });
 
         Ok(true)

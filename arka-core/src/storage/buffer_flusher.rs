@@ -1,3 +1,4 @@
+use super::lsn_manager::LSNManager;
 use super::segment_writer::{SegmentWriter, SegmentWriterError};
 use super::write_buffer::{WriteBuffer, WriteBufferError};
 use crate::indexes::pk_index::PKIndex;
@@ -44,6 +45,9 @@ pub struct BufferFlusher {
     /// Segment index to update
     segment_index: Arc<RwLock<SegmentIndex>>,
 
+    /// LSN manager for tracking durability watermarks
+    lsn_manager: Arc<LSNManager>,
+
     /// Shutdown signal
     shutdown: Arc<AtomicBool>,
 
@@ -59,17 +63,20 @@ impl BufferFlusher {
     /// * `segment_writer` - Writer for creating segment files
     /// * `pk_index` - Primary key index to update after flush
     /// * `segment_index` - Segment index to update after flush
+    /// * `lsn_manager` - LSN manager for tracking durability watermarks
     pub fn new(
         write_buffer: Arc<WriteBuffer>,
         segment_writer: Arc<SegmentWriter>,
         pk_index: Arc<RwLock<PKIndex>>,
         segment_index: Arc<RwLock<SegmentIndex>>,
+        lsn_manager: Arc<LSNManager>,
     ) -> Self {
         Self {
             write_buffer,
             segment_writer,
             pk_index,
             segment_index,
+            lsn_manager,
             shutdown: Arc::new(AtomicBool::new(false)),
             task_handle: None,
         }
@@ -83,6 +90,7 @@ impl BufferFlusher {
         let segment_writer = self.segment_writer.clone();
         let pk_index = self.pk_index.clone();
         let segment_index = self.segment_index.clone();
+        let lsn_manager = self.lsn_manager.clone();
         let shutdown = self.shutdown.clone();
 
         let handle = tokio::spawn(async move {
@@ -91,6 +99,7 @@ impl BufferFlusher {
                 segment_writer,
                 pk_index,
                 segment_index,
+                lsn_manager,
                 shutdown,
             )
             .await;
@@ -123,6 +132,7 @@ impl BufferFlusher {
         segment_writer: Arc<SegmentWriter>,
         pk_index: Arc<RwLock<PKIndex>>,
         segment_index: Arc<RwLock<SegmentIndex>>,
+        lsn_manager: Arc<LSNManager>,
         shutdown: Arc<AtomicBool>,
     ) {
         let flush_interval = write_buffer.config().flush_interval;
@@ -137,6 +147,7 @@ impl BufferFlusher {
                         &segment_writer,
                         &pk_index,
                         &segment_index,
+                        &lsn_manager,
                     ).await {
                         eprintln!("Flush error: {}", e);
                     }
@@ -151,7 +162,7 @@ impl BufferFlusher {
             if shutdown.load(Ordering::SeqCst) {
                 // Flush all remaining buffers before shutting down
                 if let Err(e) =
-                    Self::flush_all(&write_buffer, &segment_writer, &pk_index, &segment_index).await
+                    Self::flush_all(&write_buffer, &segment_writer, &pk_index, &segment_index, &lsn_manager).await
                 {
                     eprintln!("Final flush error: {}", e);
                 }
@@ -166,6 +177,7 @@ impl BufferFlusher {
         segment_writer: &Arc<SegmentWriter>,
         pk_index: &Arc<RwLock<PKIndex>>,
         segment_index: &Arc<RwLock<SegmentIndex>>,
+        lsn_manager: &Arc<LSNManager>,
     ) -> Result<(), BufferFlusherError> {
         // Check if current buffer should be frozen
         let should_freeze = write_buffer
@@ -188,7 +200,7 @@ impl BufferFlusher {
         }
 
         // Flush all frozen buffers
-        Self::flush_all(write_buffer, segment_writer, pk_index, segment_index).await
+        Self::flush_all(write_buffer, segment_writer, pk_index, segment_index, lsn_manager).await
     }
 
     /// Flush all frozen buffers
@@ -197,6 +209,7 @@ impl BufferFlusher {
         segment_writer: &Arc<SegmentWriter>,
         pk_index: &Arc<RwLock<PKIndex>>,
         segment_index: &Arc<RwLock<SegmentIndex>>,
+        lsn_manager: &Arc<LSNManager>,
     ) -> Result<(), BufferFlusherError> {
         while let Some(frozen) = write_buffer
             .pop_frozen()
@@ -205,10 +218,12 @@ impl BufferFlusher {
             Self::flush_one(
                 frozen.batches,
                 frozen.size_bytes,
+                frozen.lsn_range,
                 segment_writer,
                 pk_index,
                 segment_index,
                 write_buffer,
+                lsn_manager,
             )
             .await?;
         }
@@ -219,23 +234,25 @@ impl BufferFlusher {
     async fn flush_one(
         batches: Vec<RecordBatch>,
         size_bytes: usize,
+        lsn_range: Option<(u64, u64)>,
         segment_writer: &Arc<SegmentWriter>,
         pk_index: &Arc<RwLock<PKIndex>>,
         segment_index: &Arc<RwLock<SegmentIndex>>,
         write_buffer: &Arc<WriteBuffer>,
+        lsn_manager: &Arc<LSNManager>,
     ) -> Result<(), BufferFlusherError> {
         if batches.is_empty() {
             return Ok(());
         }
 
-        // Write all batches as a single segment
+        // Write all batches as a single segment with LSN range
         let segment_meta = if batches.len() == 1 {
             segment_writer
-                .write_batch(&batches[0])
+                .write_batches_with_lsn(&batches, lsn_range)
                 .map_err(BufferFlusherError::SegmentWriter)?
         } else {
             segment_writer
-                .write_batches(&batches)
+                .write_batches_with_lsn(&batches, lsn_range)
                 .map_err(BufferFlusherError::SegmentWriter)?
         };
 
@@ -266,6 +283,12 @@ impl BufferFlusher {
 
         // Mark bytes as flushed (releases backpressure)
         write_buffer.mark_flushed(size_bytes);
+
+        // Mark LSN as flushed to disk (durability watermark)
+        // This happens AFTER fsync completes (inside write_batches_with_lsn)
+        if let Some((_min_lsn, max_lsn)) = lsn_range {
+            lsn_manager.mark_flushed(max_lsn);
+        }
 
         Ok(())
     }
@@ -359,6 +382,7 @@ mod tests {
         let pk_index = Arc::new(RwLock::new(PKIndex::new()));
         let segment_index = Arc::new(RwLock::new(SegmentIndex::new()));
         let write_buffer = Arc::new(WriteBuffer::new());
+        let lsn_manager = Arc::new(LSNManager::new());
 
         let batch = create_test_batch(1, 100);
         let batches = vec![batch];
@@ -367,10 +391,12 @@ mod tests {
         BufferFlusher::flush_one(
             batches,
             size,
+            None,
             &segment_writer,
             &pk_index,
             &segment_index,
             &write_buffer,
+            &lsn_manager,
         )
         .await
         .unwrap();

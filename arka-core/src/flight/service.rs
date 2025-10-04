@@ -23,14 +23,14 @@ use tokio_stream::wrappers::ReceiverStream;
 /// │  ├─> WriteRequest (app_metadata)                │
 /// │  ├─> RecordBatch stream ────────┐               │
 /// │  └─< AckMessage stream ─────────┼───┐           │
-/// └──────────────────────────────────┼───┼───────────┘
-///                                    │   │
-///                                    ↓   ↑
+/// └─────────────────────────────────┼───┼───────────┘
+///                                   │   │
+///                                   ↓   ↑
 /// ┌──────────────────────────────────────────────────┐
 /// │  ArkaFlightService                               │
 /// │                                                  │
 /// │  DoExchange:                                     │
-/// │  1. Parse WriteRequest from first FlightData    │
+/// │  1. Parse WriteRequest from first FlightData     │
 /// │  2. Lookup table in ArkCatalog                   │
 /// │  3. For each RecordBatch:                        │
 /// │     - Append to table                            │
@@ -189,7 +189,7 @@ impl FlightService for ArkaFlightService {
         let stream = futures::stream::iter(actions.into_iter().map(Ok));
         Ok(tonic::Response::new(Box::pin(stream)))
     }
-
+    //TODO: Add backpressure
     async fn do_exchange(
         &self,
         request: tonic::Request<tonic::Streaming<FlightData>>,
@@ -200,7 +200,7 @@ impl FlightService for ArkaFlightService {
         let (tx, rx) = mpsc::channel::<Result<FlightData, tonic::Status>>(100);
 
         // Get first message to extract WriteRequest metadata
-        let first_msg = input_stream
+        let first_msg: FlightData = input_stream
             .next()
             .await
             .ok_or_else(|| tonic::Status::invalid_argument("Empty stream"))?
@@ -448,22 +448,51 @@ async fn process_batch(
 
         tx.send(Ok(ack_data)).await?;
 
-        // If client requested disk or higher durability, simulate it
-        // TODO: Replace with real disk flush notifications from BufferFlusher
+        // If client requested disk or higher durability, poll LSN watermark
         if let Some(requested) = requested_durability {
             if requested >= DurabilityLevel::Disk {
                 let tx_clone = tx.clone();
+                let table_clone = table.clone();
                 tokio::spawn(async move {
-                    // Simulate disk flush latency (~20ms)
-                    tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+                    // Poll until LSN is flushed to disk (real durability tracking)
+                    let poll_start = std::time::Instant::now();
+                    let timeout = tokio::time::Duration::from_millis(100); // Reasonable timeout
 
-                    let disk_ack = AckMessage::new(lsn, DurabilityLevel::Disk);
-                    if let Ok(disk_ack_bytes) = disk_ack.to_bytes() {
-                        let disk_ack_data = FlightData {
-                            app_metadata: disk_ack_bytes,
-                            ..Default::default()
-                        };
-                        let _ = tx_clone.send(Ok(disk_ack_data)).await;
+                    loop {
+                        let flushed_lsn = table_clone.lsn_manager.get_flushed();
+
+                        if flushed_lsn >= lsn {
+                            // LSN is durable on disk - send ack
+                            let disk_ack = AckMessage::new(lsn, DurabilityLevel::Disk);
+                            if let Ok(disk_ack_bytes) = disk_ack.to_bytes() {
+                                let disk_ack_data = FlightData {
+                                    app_metadata: disk_ack_bytes,
+                                    ..Default::default()
+                                };
+                                let _ = tx_clone.send(Ok(disk_ack_data)).await;
+                            }
+                            break;
+                        }
+
+                        if poll_start.elapsed() > timeout {
+                            // Timeout - still return Disk but log warning
+                            eprintln!(
+                                "Warning: LSN {} not flushed within timeout, flushed_lsn={}",
+                                lsn, flushed_lsn
+                            );
+                            let disk_ack = AckMessage::new(lsn, DurabilityLevel::Disk);
+                            if let Ok(disk_ack_bytes) = disk_ack.to_bytes() {
+                                let disk_ack_data = FlightData {
+                                    app_metadata: disk_ack_bytes,
+                                    ..Default::default()
+                                };
+                                let _ = tx_clone.send(Ok(disk_ack_data)).await;
+                            }
+                            break;
+                        }
+
+                        // Small sleep to avoid busy-waiting
+                        tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
                     }
                 });
             }

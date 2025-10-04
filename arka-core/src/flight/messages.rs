@@ -9,10 +9,10 @@ pub enum DurabilityLevel {
     /// Data flushed to local disk (fsync, ~10ms)
     Disk = 1,
 
-    /// Data uploaded to object storage (S3/R2, ~100ms)
+    /// Data uploaded to object storage (S3, ~100ms)
     ObjectStorage = 2,
 
-    /// Data committed to Iceberg table (visible in queries, ~500ms)
+    /// Data committed to Iceberg table
     IcebergCommitted = 3,
 }
 
