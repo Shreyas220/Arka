@@ -27,6 +27,10 @@ thiserror = "2.0.17"
 tonic = "0.13"  # Must match arrow-flight's tonic version
 prost = "0.13"
 bytes = "1.0"
+rayon = "1.8"  # Parallel iterators for statistics extraction
+num = "0.4"    # Numeric traits for min/max extraction
+datafusion = "50.1"  # Query engine with Arrow integration
+async-trait = "0.1"  # Required for async TableProvider trait
 
 [dev-dependencies]
 tempfile = "3.0"

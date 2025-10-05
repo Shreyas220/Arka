@@ -8,6 +8,7 @@ use super::RowLocation;
 /// in the storage system. Also tracks reverse mapping for efficient pruning.
 ///
 /// Memory usage: ~64 bytes per key for single primary key
+#[derive(Debug)]
 pub struct PKIndex {
     /// Main index: primary key → row location
     /// This enables O(1) lookups for CDC operations and point queries

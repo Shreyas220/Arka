@@ -1,5 +1,6 @@
-use std::collections::BTreeMap;
 use crate::storage::segment::{SegmentId, SegmentMeta};
+use std::collections::BTreeMap;
+use std::sync::Arc;
 
 /// In-memory index of all segments in the system
 ///
@@ -8,10 +9,17 @@ use crate::storage::segment::{SegmentId, SegmentMeta};
 /// - Finding segments in a time range
 /// - Finding uncommitted segments
 /// - Memory management (tracking what can be pruned)
+///
+/// Memory optimization: Stores Arc<SegmentMeta> instead of SegmentMeta directly.
+/// This makes cloning segment metadata ultra-cheap (8 bytes per clone instead of
+/// potentially kilobytes), which is critical for query pruning where we need to
+/// snapshot segment metadata.
+#[derive(Debug)]
 pub struct SegmentIndex {
     /// Segments ordered by ID (epoch/LSN)
     /// BTreeMap provides ordered iteration and range queries
-    segments: BTreeMap<SegmentId, SegmentMeta>,
+    /// Arc wrapper makes cloning cheap for query pruning
+    segments: BTreeMap<SegmentId, Arc<SegmentMeta>>,
 }
 
 impl SegmentIndex {
@@ -23,18 +31,22 @@ impl SegmentIndex {
     }
 
     /// Insert or update segment metadata
+    /// Wraps SegmentMeta in Arc for cheap cloning
     pub fn insert(&mut self, meta: SegmentMeta) {
-        self.segments.insert(meta.id, meta);
+        self.segments.insert(meta.id, Arc::new(meta));
     }
 
     /// Get segment metadata by ID
-    pub fn get(&self, id: SegmentId) -> Option<&SegmentMeta> {
-        self.segments.get(&id)
+    /// Returns Arc clone (cheap - just 8 bytes)
+    pub fn get(&self, id: SegmentId) -> Option<Arc<SegmentMeta>> {
+        self.segments.get(&id).cloned()
     }
 
     /// Get mutable reference to segment metadata
+    /// Note: This requires Arc::make_mut which may clone if refcount > 1
+    /// Use sparingly - prefer immutable access via get()
     pub fn get_mut(&mut self, id: SegmentId) -> Option<&mut SegmentMeta> {
-        self.segments.get_mut(&id)
+        self.segments.get_mut(&id).map(Arc::make_mut)
     }
 
     /// Find all segments that overlap with the given time range
@@ -63,9 +75,11 @@ impl SegmentIndex {
         self.segments.keys().copied().collect()
     }
 
-    /// Get all segment metadata
-    pub fn all(&self) -> Vec<&SegmentMeta> {
-        self.segments.values().collect()
+    /// Get all segment metadata as Arc clones
+    /// This is cheap! Each Arc clone is only 8 bytes
+    /// Perfect for query pruning where we need a snapshot
+    pub fn all(&self) -> Vec<Arc<SegmentMeta>> {
+        self.segments.values().cloned().collect()
     }
 
     /// Find segments that haven't been committed to Iceberg
@@ -88,9 +102,10 @@ impl SegmentIndex {
     }
 
     /// Mark a segment as committed to Iceberg
+    /// Uses Arc::make_mut which may clone if other references exist
     pub fn mark_committed(&mut self, id: SegmentId) -> bool {
         if let Some(segment) = self.segments.get_mut(&id) {
-            segment.committed_to_iceberg = true;
+            Arc::make_mut(segment).committed_to_iceberg = true;
             true
         } else {
             false
@@ -98,8 +113,8 @@ impl SegmentIndex {
     }
 
     /// Remove a segment from the index
-    /// Returns the removed metadata if it existed
-    pub fn remove(&mut self, id: SegmentId) -> Option<SegmentMeta> {
+    /// Returns the removed metadata if it existed (wrapped in Arc)
+    pub fn remove(&mut self, id: SegmentId) -> Option<Arc<SegmentMeta>> {
         self.segments.remove(&id)
     }
 
@@ -141,6 +156,7 @@ impl Default for SegmentIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::path::PathBuf;
 
     fn create_test_segment(id: u64, time_min: i64, time_max: i64, committed: bool) -> SegmentMeta {
@@ -153,6 +169,7 @@ mod tests {
             lsn_range: (id * 1000, (id + 1) * 1000 - 1),
             created_at: chrono::Utc::now().timestamp() - (100 - id as i64), // Older segments have earlier timestamp
             committed_to_iceberg: committed,
+            column_stats: HashMap::new(),
         }
     }
 
@@ -216,8 +233,10 @@ mod tests {
         let mut index = SegmentIndex::new();
         index.insert(create_test_segment(1, 0, 100, false));
 
-        assert!(!index.get(1).unwrap().committed_to_iceberg);
+        let seg = index.get(1).unwrap();
+        assert!(!seg.committed_to_iceberg);
         assert!(index.mark_committed(1));
-        assert!(index.get(1).unwrap().committed_to_iceberg);
+        let seg = index.get(1).unwrap();
+        assert!(seg.committed_to_iceberg);
     }
 }

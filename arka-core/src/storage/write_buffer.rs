@@ -353,7 +353,7 @@ mod tests {
         let buffer = WriteBuffer::new();
 
         let batch = create_test_batch(100);
-        let should_freeze = buffer.append(batch.clone()).await.unwrap();
+        let should_freeze = buffer.append(batch.clone(), 0).await.unwrap();
 
         assert!(!should_freeze); // Small batch shouldn't trigger freeze
         assert_eq!(buffer.current_batch_count().unwrap(), 1);
@@ -372,7 +372,7 @@ mod tests {
         let buffer = WriteBuffer::new();
 
         let batch = create_test_batch(100);
-        buffer.append(batch.clone()).await.unwrap();
+        buffer.append(batch.clone(), 0).await.unwrap();
         buffer.freeze_current().unwrap();
 
         // Pop frozen buffer
@@ -396,7 +396,7 @@ mod tests {
             RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(Vec::<i64>::new()))])
                 .unwrap();
 
-        let result = buffer.append(empty_batch).await;
+        let result = buffer.append(empty_batch, 0).await;
         assert!(result.is_err());
     }
 
@@ -421,7 +421,7 @@ mod tests {
         let buffer = WriteBuffer::with_config(config);
 
         let batch = create_test_batch(1000); // Large batch
-        let should_freeze = buffer.append(batch).await.unwrap();
+        let should_freeze = buffer.append(batch, 0).await.unwrap();
 
         // Should trigger freeze due to size
         assert!(should_freeze);
@@ -437,8 +437,8 @@ mod tests {
 
         let buffer = WriteBuffer::with_config(config);
 
-        buffer.append(create_test_batch(10)).await.unwrap();
-        let should_freeze = buffer.append(create_test_batch(10)).await.unwrap();
+        buffer.append(create_test_batch(10), 0).await.unwrap();
+        let should_freeze = buffer.append(create_test_batch(10), 0).await.unwrap();
 
         // Should trigger freeze on count
         assert!(should_freeze);
@@ -449,7 +449,7 @@ mod tests {
         let buffer = WriteBuffer::new();
 
         let batch = create_test_batch(100);
-        buffer.append(batch).await.unwrap();
+        buffer.append(batch, 0).await.unwrap();
 
         let initial_unflushed = buffer.unflushed_bytes();
         assert!(initial_unflushed > 0);
@@ -463,13 +463,13 @@ mod tests {
         let buffer = WriteBuffer::new();
 
         // Add and freeze 3 buffers
-        buffer.append(create_test_batch(10)).await.unwrap();
+        buffer.append(create_test_batch(10), 0).await.unwrap();
         buffer.freeze_current().unwrap();
 
-        buffer.append(create_test_batch(20)).await.unwrap();
+        buffer.append(create_test_batch(20), 0).await.unwrap();
         buffer.freeze_current().unwrap();
 
-        buffer.append(create_test_batch(30)).await.unwrap();
+        buffer.append(create_test_batch(30), 0).await.unwrap();
         buffer.freeze_current().unwrap();
 
         assert_eq!(buffer.frozen_count().unwrap(), 3);

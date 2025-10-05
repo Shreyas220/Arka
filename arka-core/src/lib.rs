@@ -14,6 +14,7 @@ use tokio::sync::watch;
 pub mod catalog;
 pub mod flight;
 pub mod indexes;
+pub mod query;
 pub mod storage;
 
 #[derive(Debug, Clone)]

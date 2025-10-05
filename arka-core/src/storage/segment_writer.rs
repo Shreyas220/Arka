@@ -1,7 +1,11 @@
 use super::config::{DurabilityLevel, SegmentWriterConfig};
-use super::segment::{SegmentId, SegmentMeta};
+use super::segment::{ColumnStats, SegmentId, SegmentMeta};
+use arrow::array::*;
+use arrow::datatypes::{DataType, TimeUnit};
 use arrow::ipc::writer::FileWriter;
 use arrow::record_batch::RecordBatch;
+use rayon::prelude::*;
+use std::collections::HashMap;
 use std::fs::{create_dir_all, File};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -178,6 +182,10 @@ impl SegmentWriter {
         let mut min_lsn = u64::MAX;
         let mut max_lsn = u64::MIN;
 
+        // Column statistics accumulator
+        let mut column_stats_accumulators: HashMap<String, GlobalColumnAccumulator> =
+            HashMap::new();
+
         for batch in batches {
             total_rows += batch.num_rows();
 
@@ -193,6 +201,17 @@ impl SegmentWriter {
                     min_lsn = min_lsn.min(min);
                     max_lsn = max_lsn.max(max);
                 }
+            }
+
+            // Extract column statistics with adaptive parallelization
+            let batch_stats = extract_column_statistics(batch)?;
+
+            // Merge batch statistics into global accumulators
+            for (col_name, batch_stat) in batch_stats {
+                column_stats_accumulators
+                    .entry(col_name)
+                    .or_insert_with(|| GlobalColumnAccumulator::new(batch_stat.data_type.clone()))
+                    .merge(batch_stat);
             }
         }
 
@@ -237,6 +256,16 @@ impl SegmentWriter {
             .map_err(|e| SegmentWriterError::FileMetadata(file_path.clone(), e))?
             .len();
 
+        // Finalize column statistics
+        let column_stats: HashMap<String, ColumnStats> = column_stats_accumulators
+            .into_iter()
+            .map(|(name, acc)| {
+                let mut stats = acc.finalize();
+                stats.column_name = name.clone();
+                (name, stats)
+            })
+            .collect();
+
         Ok(SegmentMeta {
             id: segment_id,
             file_path,
@@ -246,6 +275,7 @@ impl SegmentWriter {
             lsn_range: (min_lsn, max_lsn),
             created_at: chrono::Utc::now().timestamp(),
             committed_to_iceberg: false,
+            column_stats,
         })
     }
 
@@ -264,6 +294,9 @@ impl SegmentWriter {
         // Extract LSN range if __lsn column exists
         let lsn_range = extract_lsn_range(batch)?.unwrap_or((u64::MAX, u64::MIN));
 
+        // Extract column statistics
+        let column_stats = extract_column_statistics(batch)?;
+
         Ok(SegmentMeta {
             id: segment_id,
             file_path: file_path.to_path_buf(),
@@ -273,6 +306,7 @@ impl SegmentWriter {
             lsn_range,
             created_at: chrono::Utc::now().timestamp(),
             committed_to_iceberg: false,
+            column_stats,
         })
     }
 
@@ -420,6 +454,288 @@ fn extract_lsn_range(batch: &RecordBatch) -> Result<Option<(u64, u64)>, SegmentW
     Ok(None)
 }
 
+/// Extract column statistics from a RecordBatch with adaptive parallelization
+fn extract_column_statistics(
+    batch: &RecordBatch,
+) -> Result<HashMap<String, ColumnStats>, SegmentWriterError> {
+    let schema = batch.schema();
+    let fields: Vec<_> = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| is_comparable_type(f.data_type()))
+        .collect();
+
+    // Adaptive parallelization: use Rayon if workload is large enough
+    let should_parallelize = fields.len() > 5 || batch.num_rows() > 10_000;
+
+    if should_parallelize {
+        // Parallel extraction for wide tables or large batches
+        Ok(fields
+            .par_iter()
+            .filter_map(|(idx, field)| {
+                let array = batch.column(*idx);
+                extract_stats_for_column(field, array.as_ref())
+                    .ok()
+                    .map(|stats| (field.name().clone(), stats))
+            })
+            .collect())
+    } else {
+        // Sequential extraction for small batches (avoid thread overhead)
+        Ok(fields
+            .iter()
+            .filter_map(|(idx, field)| {
+                let array = batch.column(*idx);
+                extract_stats_for_column(field, array.as_ref())
+                    .ok()
+                    .map(|stats| (field.name().clone(), stats))
+            })
+            .collect())
+    }
+}
+
+/// Check if a data type supports min/max statistics
+/// Only numeric and temporal types are useful for range pruning
+fn is_comparable_type(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Timestamp(_, _)
+            | DataType::Date32
+            | DataType::Date64
+            | DataType::Decimal128(_, _)
+            | DataType::Decimal256(_, _)
+    )
+}
+
+/// Extract statistics for a single column
+fn extract_stats_for_column(
+    field: &arrow::datatypes::Field,
+    array: &dyn arrow::array::Array,
+) -> Result<ColumnStats, SegmentWriterError> {
+    let (min_value, max_value) = extract_min_max_for_type(array, field.data_type())?;
+
+    Ok(ColumnStats {
+        column_name: field.name().clone(),
+        data_type: field.data_type().clone(),
+        min_value,
+        max_value,
+        null_count: array.null_count(),
+        value_count: array.len(),
+    })
+}
+
+/// Dispatch to type-specific min/max extraction
+fn extract_min_max_for_type(
+    array: &dyn arrow::array::Array,
+    data_type: &DataType,
+) -> Result<(Option<Vec<u8>>, Option<Vec<u8>>), SegmentWriterError> {
+    match data_type {
+        DataType::Int8 => extract_primitive_min_max::<arrow::datatypes::Int8Type>(array),
+        DataType::Int16 => extract_primitive_min_max::<arrow::datatypes::Int16Type>(array),
+        DataType::Int32 => extract_primitive_min_max::<arrow::datatypes::Int32Type>(array),
+        DataType::Int64 => extract_primitive_min_max::<arrow::datatypes::Int64Type>(array),
+        DataType::UInt8 => extract_primitive_min_max::<arrow::datatypes::UInt8Type>(array),
+        DataType::UInt16 => extract_primitive_min_max::<arrow::datatypes::UInt16Type>(array),
+        DataType::UInt32 => extract_primitive_min_max::<arrow::datatypes::UInt32Type>(array),
+        DataType::UInt64 => extract_primitive_min_max::<arrow::datatypes::UInt64Type>(array),
+        DataType::Float32 => extract_float_min_max::<arrow::datatypes::Float32Type>(array),
+        DataType::Float64 => extract_float_min_max::<arrow::datatypes::Float64Type>(array),
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+            extract_primitive_min_max::<arrow::datatypes::TimestampNanosecondType>(array)
+        }
+        DataType::Timestamp(TimeUnit::Microsecond, _) => {
+            extract_primitive_min_max::<arrow::datatypes::TimestampMicrosecondType>(array)
+        }
+        DataType::Timestamp(TimeUnit::Millisecond, _) => {
+            extract_primitive_min_max::<arrow::datatypes::TimestampMillisecondType>(array)
+        }
+        DataType::Timestamp(TimeUnit::Second, _) => {
+            extract_primitive_min_max::<arrow::datatypes::TimestampSecondType>(array)
+        }
+        DataType::Date32 => extract_primitive_min_max::<arrow::datatypes::Date32Type>(array),
+        DataType::Date64 => extract_primitive_min_max::<arrow::datatypes::Date64Type>(array),
+        _ => Ok((None, None)), // Unsupported type
+    }
+}
+
+/// Extract min/max for primitive types using BIG-ENDIAN encoding for correct byte comparison
+fn extract_primitive_min_max<T>(
+    array: &dyn arrow::array::Array,
+) -> Result<(Option<Vec<u8>>, Option<Vec<u8>>), SegmentWriterError>
+where
+    T: arrow::datatypes::ArrowPrimitiveType,
+    T::Native: std::cmp::Ord,
+{
+    let primitive_array = array
+        .as_any()
+        .downcast_ref::<arrow::array::PrimitiveArray<T>>()
+        .ok_or(SegmentWriterError::InvalidArrayType)?;
+
+    if primitive_array.null_count() == primitive_array.len() {
+        return Ok((None, None)); // All nulls
+    }
+
+    // Use Rayon for large arrays
+    if primitive_array.len() > 10_000 {
+        let (min_val, max_val) = (0..primitive_array.len())
+            .into_par_iter()
+            .filter(|&i| primitive_array.is_valid(i))
+            .map(|i| {
+                let v = primitive_array.value(i);
+                (v, v)
+            })
+            .reduce(
+                || (T::Native::default(), T::Native::default()),
+                |(min1, max1), (min2, max2)| {
+                    (
+                        if min1 < min2 { min1 } else { min2 },
+                        if max1 > max2 { max1 } else { max2 },
+                    )
+                },
+            );
+
+        return Ok((
+            Some(value_to_be_bytes(&min_val)),
+            Some(value_to_be_bytes(&max_val)),
+        ));
+    }
+
+    // Sequential for small arrays
+    let mut min = None;
+    let mut max = None;
+
+    for i in 0..primitive_array.len() {
+        if primitive_array.is_valid(i) {
+            let val = primitive_array.value(i);
+            min = Some(min.map_or(val, |m: T::Native| m.min(val)));
+            max = Some(max.map_or(val, |m: T::Native| m.max(val)));
+        }
+    }
+
+    Ok((
+        min.map(|v| value_to_be_bytes(&v)),
+        max.map(|v| value_to_be_bytes(&v)),
+    ))
+}
+
+/// Convert a native type to big-endian bytes
+fn value_to_be_bytes<T: Copy>(value: &T) -> Vec<u8> {
+    let size = std::mem::size_of::<T>();
+    let ptr = value as *const T as *const u8;
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, size) };
+
+    // Convert to big-endian if necessary
+    let mut result = bytes.to_vec();
+    if cfg!(target_endian = "little") {
+        result.reverse();
+    }
+    result
+}
+
+/// Extract min/max for float types (handles NaN, uses BIG-ENDIAN)
+fn extract_float_min_max<T>(
+    array: &dyn arrow::array::Array,
+) -> Result<(Option<Vec<u8>>, Option<Vec<u8>>), SegmentWriterError>
+where
+    T: arrow::datatypes::ArrowPrimitiveType,
+    T::Native: num::Float + Copy,
+{
+    use num::Float;
+    let float_array = array
+        .as_any()
+        .downcast_ref::<arrow::array::PrimitiveArray<T>>()
+        .ok_or(SegmentWriterError::InvalidArrayType)?;
+
+    if float_array.null_count() == float_array.len() {
+        return Ok((None, None));
+    }
+
+    let mut min = None;
+    let mut max = None;
+
+    for i in 0..float_array.len() {
+        if float_array.is_valid(i) {
+            let val = float_array.value(i);
+            if !val.is_nan() {
+                min = Some(min.map_or(val, |m: T::Native| if val < m { val } else { m }));
+                max = Some(max.map_or(val, |m: T::Native| if val > m { val } else { m }));
+            }
+        }
+    }
+
+    Ok((
+        min.map(|v| value_to_be_bytes(&v)),
+        max.map(|v| value_to_be_bytes(&v)),
+    ))
+}
+
+/// Accumulator for merging statistics across batches
+struct GlobalColumnAccumulator {
+    data_type: DataType,
+    min_value: Option<Vec<u8>>,
+    max_value: Option<Vec<u8>>,
+    null_count: usize,
+    value_count: usize,
+}
+
+impl GlobalColumnAccumulator {
+    fn new(data_type: DataType) -> Self {
+        Self {
+            data_type,
+            min_value: None,
+            max_value: None,
+            null_count: 0,
+            value_count: 0,
+        }
+    }
+
+    fn merge(&mut self, batch_stats: ColumnStats) {
+        // Update min
+        if let Some(batch_min) = batch_stats.min_value {
+            self.min_value = Some(match &self.min_value {
+                Some(current_min) if current_min.as_slice() <= batch_min.as_slice() => {
+                    current_min.clone()
+                }
+                _ => batch_min,
+            });
+        }
+
+        // Update max
+        if let Some(batch_max) = batch_stats.max_value {
+            self.max_value = Some(match &self.max_value {
+                Some(current_max) if current_max.as_slice() >= batch_max.as_slice() => {
+                    current_max.clone()
+                }
+                _ => batch_max,
+            });
+        }
+
+        self.null_count += batch_stats.null_count;
+        self.value_count += batch_stats.value_count;
+    }
+
+    fn finalize(self) -> ColumnStats {
+        ColumnStats {
+            column_name: String::new(), // Set by caller
+            data_type: self.data_type,
+            min_value: self.min_value,
+            max_value: self.max_value,
+            null_count: self.null_count,
+            value_count: self.value_count,
+        }
+    }
+}
+
 /// Errors that can occur during segment writing
 #[derive(Debug, thiserror::Error)]
 pub enum SegmentWriterError {
@@ -443,6 +759,9 @@ pub enum SegmentWriterError {
 
     #[error("Cannot write empty batch")]
     EmptyBatch,
+
+    #[error("Invalid array type for statistics extraction")]
+    InvalidArrayType,
 }
 
 #[cfg(test)]
