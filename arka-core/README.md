@@ -1,5 +1,10 @@
 # Arka: High-Performance Streaming Buffer for Apache Iceberg
 
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/8dcba26b-b5bc-4246-9639-01fd49a25625" width="250">
+</p>
+
+
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org/)
 [![Iceberg](https://img.shields.io/badge/Apache%20Iceberg-compatible-brightgreen.svg)](https://iceberg.apache.org/)
@@ -351,19 +356,6 @@ async fn main() -> Result<()> {
     Ok(())
 }
 ```
-
-## Comparison with Existing Systems
-
-| Feature | Arka | Fluss | Moonlink | Kafka | ClickHouse |
-|---------|------|-------|----------|-------|------------|
-| **Primary Use Case** | Streaming→Lakehouse | Real-time KV+CDC | Iceberg Ingestion | Message Queue | Real-time Analytics |
-| **Query Latency (Hot)** | <1ms | <1ms | 10ms | N/A | <10ms |
-| **Query Latency (Warm)** | 1-10ms | 10ms | 100ms | N/A | 10-100ms |
-| **Iceberg Native** | ✅ | ❌ | ✅ | ❌ | ❌ |
-| **CDC Support** | ✅ Full | ✅ Full | ✅ Basic | ✅ Log | ✅ Basic |
-| **Memory Management** | 3-zone | TODO | Row limits | Paging | Settings |
-| **Disk Cache** | Query+Stage | RocksDB | Stage only | Log only | MergeTree |
-| **Cloud Native** | ✅ | ⚠️ | ✅ | ⚠️ | ⚠️ |
 
 ## Key Innovations
 
